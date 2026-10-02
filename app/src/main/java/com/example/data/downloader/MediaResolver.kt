@@ -5,6 +5,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
+import java.net.URLEncoder
 import java.net.URLDecoder
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -23,6 +25,7 @@ data class ResolvedStream(
 )
 
 object MediaResolver {
+    private const val REMOTE_RESOLVER_BASE_URL = "https://omnibrowser-media-api.onrender.com"
     private val client = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
@@ -44,7 +47,9 @@ object MediaResolver {
 
             if (YouTubeExtractor.isYouTubeUrl(value)) {
                 DiagnosticLogger.i("MediaResolver", "تحويل رابط يوتيوب إلى المحلل المحلي On-Device Extractor: $value")
-                return@withContext YouTubeExtractor.resolveDirectStream(value, isAudio)
+                YouTubeExtractor.resolveDirectStream(value, isAudio)?.let { return@withContext it }
+                DiagnosticLogger.w("MediaResolver", "تعذر الاستخراج المحلي؛ تجربة خادم Render الاحتياطي")
+                return@withContext resolveViaBackend(value, isAudio)
             }
 
             val request = Request.Builder()
@@ -84,8 +89,37 @@ object MediaResolver {
             }
 
             DiagnosticLogger.w("MediaResolver", "الرابط لا يعلن عن ملف وسائط مباشر: $value")
+            resolveViaBackend(value, isAudio)
+        }
+
+    private fun resolveViaBackend(source: String, isAudio: Boolean): ResolvedStream? {
+        return try {
+            val encoded = URLEncoder.encode(source, "UTF-8")
+            val url = "$REMOTE_RESOLVER_BASE_URL/resolve?url=$encoded&audio=$isAudio"
+            val request = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return null
+                val body = response.body?.string().orEmpty()
+                val json = JSONObject(body)
+                val streamUrl = json.optString("stream_url").trim()
+                if (streamUrl.isBlank()) return null
+                ResolvedStream(
+                    url = streamUrl,
+                    quality = json.optString("quality", "remote") ,
+                    mimeType = json.optString("mime_type", guessMimeType(streamUrl, isAudio)),
+                    sizeBytes = json.optLong("filesize", 0L),
+                    isAudioOnly = json.optBoolean("is_audio_only", isAudio),
+                    isEstimatedSize = json.optLong("filesize", 0L) == 0L
+                )
+            }
+        } catch (e: Exception) {
+            DiagnosticLogger.w("MediaResolver", "تعذر الاتصال بخادم Render: ${e.message}")
             null
         }
+    }
 
     private fun isMediaType(type: String): Boolean =
         type.startsWith("video/") || type.startsWith("audio/") ||
